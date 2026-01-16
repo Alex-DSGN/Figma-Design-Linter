@@ -1,0 +1,21 @@
+{
+  "name": "figma-design-linter",
+  "version": "1.0.0",
+  "description": "A Figma plugin that lints designs for Style and Variable usage",
+  "scripts": {
+    "build": "tsc && tsc -p tsconfig.ui.json",
+    "watch": "tsc --watch & tsc -p tsconfig.ui.json --watch"
+  },
+  "keywords": [
+    "figma",
+    "plugin",
+    "linter",
+    "design-system"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.88.0",
+    "typescript": "^5.0.0"
+  }
+}

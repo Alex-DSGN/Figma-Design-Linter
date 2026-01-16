@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Design Linter</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 12px;
+      color: #333;
+      background: #fff;
+      padding: 16px;
+    }
+
+    .header {
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    select {
+      flex: 1;
+      padding: 8px;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      font-size: 12px;
+      background: #fff;
+    }
+
+    button {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    button.primary {
+      background: #18a0fb;
+      color: #fff;
+    }
+
+    button.primary:hover {
+      background: #1590e6;
+    }
+
+    button.secondary {
+      background: #f0f0f0;
+      color: #333;
+      margin-left: 8px;
+    }
+
+    button.secondary:hover {
+      background: #e0e0e0;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .stats {
+      display: flex;
+      gap: 16px;
+      padding: 12px;
+      background: #f8f8f8;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      font-size: 11px;
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .stat-label {
+      color: #666;
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .stat-value.error {
+      color: #e53935;
+    }
+
+    .stat-value.warn {
+      color: #ff9800;
+    }
+
+    .results {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+
+    .results-empty {
+      text-align: center;
+      padding: 32px;
+      color: #999;
+    }
+
+    .issue-group {
+      margin-bottom: 16px;
+    }
+
+    .group-header {
+      font-weight: 600;
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+      padding: 4px 0;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .issue {
+      padding: 8px;
+      margin-bottom: 4px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+      border-left: 3px solid transparent;
+    }
+
+    .issue:hover {
+      background: #f5f5f5;
+    }
+
+    .issue.error {
+      border-left-color: #e53935;
+    }
+
+    .issue.warn {
+      border-left-color: #ff9800;
+    }
+
+    .issue-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    .issue-severity {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+
+    .issue-severity.error {
+      background: #ffebee;
+      color: #e53935;
+    }
+
+    .issue-severity.warn {
+      background: #fff3e0;
+      color: #ff9800;
+    }
+
+    .issue-type {
+      font-size: 10px;
+      color: #999;
+    }
+
+    .issue-message {
+      font-size: 11px;
+      color: #333;
+      margin-bottom: 2px;
+    }
+
+    .issue-path {
+      font-size: 10px;
+      color: #999;
+      font-family: 'Monaco', 'Courier New', monospace;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 32px;
+      color: #999;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Design Linter</h1>
+    <div class="controls">
+      <select id="scope-select">
+        <option value="selection">Selection</option>
+        <option value="currentPage" selected>Current Page</option>
+      </select>
+      <button id="run-btn" class="primary">Run</button>
+    </div>
+  </div>
+
+  <div id="stats" class="stats" style="display: none;">
+    <div class="stat">
+      <div class="stat-label">Total Issues</div>
+      <div class="stat-value" id="total-count">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Errors</div>
+      <div class="stat-value error" id="error-count">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Warnings</div>
+      <div class="stat-value warn" id="warn-count">0</div>
+    </div>
+  </div>
+
+  <div id="results" class="results"></div>
+
+  <div style="margin-top: 16px; text-align: right;">
+    <button id="copy-btn" class="secondary" style="display: none;">Copy report (JSON)</button>
+  </div>
+
+  <script src="ui.js"></script>
+</body>
+</html>
