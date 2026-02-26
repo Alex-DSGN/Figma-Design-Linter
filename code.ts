@@ -50,6 +50,74 @@ interface FilterOptions {
   containerName?: string;
 }
 
+type ContrastLevel = 'aa' | 'aaa';
+
+interface AccessibilityOptions {
+  contrastLevel: ContrastLevel;
+  warnTransparent: boolean;
+}
+
+let accessibilityOptions: AccessibilityOptions = {
+  contrastLevel: 'aa',
+  warnTransparent: true,
+};
+
+let issueCounter = 0;
+function makeIssueId(base: string): string {
+  issueCounter += 1;
+  return `${base}-${issueCounter}`;
+}
+
+const CLIENT_STORAGE_KEY = 'design-linter-settings';
+
+type StoredSettings = {
+  scope?: Scope;
+  checks?: Record<string, any>;
+  contrastLevel?: ContrastLevel;
+  warnTransparent?: boolean;
+  nodeFilters?: Record<string, boolean>;
+};
+
+const defaultSettings: StoredSettings = {
+  scope: 'currentPage',
+  checks: {
+    colors: true,
+    accessibility: true,
+    unusedStyles: true,
+    unusedTextStyles: true,
+    unusedEffectStyles: true,
+    textStyles: true,
+    effects: true,
+  },
+  contrastLevel: 'aa',
+  warnTransparent: true,
+  nodeFilters: {
+    components: true,
+    instances: true,
+    text: true,
+    containers: true,
+    shapes: true,
+  },
+};
+
+async function loadSettings(): Promise<StoredSettings> {
+  try {
+    const stored = await figma.clientStorage.getAsync(CLIENT_STORAGE_KEY);
+    return { ...defaultSettings, ...(stored || {}) };
+  } catch (error) {
+    console.error('Failed to load settings', error);
+    return defaultSettings;
+  }
+}
+
+async function saveSettings(settings: StoredSettings): Promise<void> {
+  try {
+    await figma.clientStorage.setAsync(CLIENT_STORAGE_KEY, settings);
+  } catch (error) {
+    console.error('Failed to save settings', error);
+  }
+}
+
 // ============================================================================
 // Rule Engine
 // ============================================================================
@@ -98,6 +166,60 @@ function getPath(node: SceneNode): string {
   }
 
   return parts.join(' / ');
+}
+
+type RGBAColor = { r: number; g: number; b: number; a: number };
+
+const WHITE: RGBAColor = { r: 1, g: 1, b: 1, a: 1 };
+
+function composite(top: RGBAColor, bottom: RGBAColor): RGBAColor {
+  const a = top.a + bottom.a * (1 - top.a);
+  if (a === 0) {
+    return { r: 0, g: 0, b: 0, a: 0 };
+  }
+  return {
+    r: (top.r * top.a + bottom.r * bottom.a * (1 - top.a)) / a,
+    g: (top.g * top.a + bottom.g * bottom.a * (1 - top.a)) / a,
+    b: (top.b * top.a + bottom.b * bottom.a * (1 - top.a)) / a,
+    a,
+  };
+}
+
+function rgbaToOpaque(color: RGBAColor, backdrop: RGBAColor = WHITE): RGB {
+  const out = composite(color, backdrop);
+  return { r: out.r, g: out.g, b: out.b };
+}
+
+function paintToColor(paint: Paint): RGBAColor | null {
+  if (paint.type === 'SOLID') {
+    const opacity = paint.opacity !== undefined ? paint.opacity : 1;
+    return { r: paint.color.r, g: paint.color.g, b: paint.color.b, a: opacity };
+  }
+  if (paint.type.startsWith('GRADIENT') && 'gradientStops' in paint && paint.gradientStops.length > 0) {
+    // Approximate gradient by the first stop
+    const stop = paint.gradientStops[0];
+    const opacity = paint.opacity !== undefined ? paint.opacity : 1;
+    return { r: stop.color.r, g: stop.color.g, b: stop.color.b, a: (stop.color.a ?? 1) * opacity };
+  }
+  return null;
+}
+
+function compositePaints(
+  paints: readonly Paint[] | typeof figma.mixed,
+  base: RGBAColor
+): RGBAColor | null {
+  if (!paints || paints === figma.mixed || paints.length === 0) {
+    return null;
+  }
+
+  let result = base;
+  for (const paint of paints) {
+    if (paint.visible === false) continue;
+    const color = paintToColor(paint);
+    if (!color) continue;
+    result = composite(color, result);
+  }
+  return result;
 }
 
 function getTopContainer(node: SceneNode): { name: string; node: BaseNode } {
@@ -282,7 +404,7 @@ function lintColors(node: SceneNode): Issue[] {
   ): void {
     if (paints === figma.mixed) {
       issues.push({
-        id: `${node.id}-${property}-mixed`,
+        id: makeIssueId(`${node.id}-${property}-mixed`),
         nodeId: node.id,
         nodeType: node.type,
         pageName,
@@ -332,7 +454,7 @@ function lintColors(node: SceneNode): Issue[] {
           const propertyName = propertyNames[property] || property;
           const paintTypeName = paintTypeNames[paintType] || paintType;
           issues.push({
-            id: `${node.id}-${property}-${i}`,
+            id: makeIssueId(`${node.id}-${property}-${i}`),
             nodeId: node.id,
             nodeType: node.type,
             pageName,
@@ -370,6 +492,7 @@ function lintColors(node: SceneNode): Issue[] {
 
   return issues;
 }
+
 
 // ============================================================================
 // Unused Styles Check
@@ -409,7 +532,7 @@ function lintUnusedStyles(allNodes: SceneNode[]): Issue[] {
     for (const style of localStyles) {
       if (!usedStyleIds.has(style.id)) {
         issues.push({
-          id: `unused-style-${style.id}`,
+          id: makeIssueId(`unused-style-${style.id}`),
           nodeId: '', // No specific node
           nodeType: undefined,
           pageName,
@@ -425,6 +548,84 @@ function lintUnusedStyles(allNodes: SceneNode[]): Issue[] {
     console.error('Error checking unused styles:', error);
   }
   
+  return issues;
+}
+
+function lintUnusedTextStyles(allNodes: SceneNode[]): Issue[] {
+  const issues: Issue[] = [];
+  const usedTextStyleIds = new Set<string>();
+
+  for (const node of allNodes) {
+    if ('textStyleId' in node) {
+      const textStyleId = node.textStyleId;
+      if (textStyleId && typeof textStyleId === 'string') {
+        usedTextStyleIds.add(textStyleId);
+      }
+    }
+  }
+
+  try {
+    const localTextStyles = figma.getLocalTextStyles();
+    const pageName = allNodes.length > 0 ? getPageName(allNodes[0]) : 'Unknown';
+
+    for (const style of localTextStyles) {
+      if (!usedTextStyleIds.has(style.id)) {
+        issues.push({
+          id: makeIssueId(`unused-text-style-${style.id}`),
+          nodeId: '',
+          nodeType: undefined,
+          pageName,
+          containerName: 'Текстовые стили',
+          severity: 'warn',
+          type: 'unused-text-style',
+          message: `Текстовый стиль "${style.name}" не используется`,
+          path: `Text Style: ${style.name}`,
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error checking unused text styles:', error);
+  }
+
+  return issues;
+}
+
+function lintUnusedEffectStyles(allNodes: SceneNode[]): Issue[] {
+  const issues: Issue[] = [];
+  const usedEffectStyleIds = new Set<string>();
+
+  for (const node of allNodes) {
+    if ('effectStyleId' in node) {
+      const effectStyleId = node.effectStyleId;
+      if (effectStyleId && typeof effectStyleId === 'string') {
+        usedEffectStyleIds.add(effectStyleId);
+      }
+    }
+  }
+
+  try {
+    const localEffectStyles = figma.getLocalEffectStyles();
+    const pageName = allNodes.length > 0 ? getPageName(allNodes[0]) : 'Unknown';
+
+    for (const style of localEffectStyles) {
+      if (!usedEffectStyleIds.has(style.id)) {
+        issues.push({
+          id: makeIssueId(`unused-effect-style-${style.id}`),
+          nodeId: '',
+          nodeType: undefined,
+          pageName,
+          containerName: 'Эффекты',
+          severity: 'warn',
+          type: 'unused-effect-style',
+          message: `Effect Style "${style.name}" не используется`,
+          path: `Effect Style: ${style.name}`,
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error checking unused effect styles:', error);
+  }
+
   return issues;
 }
 
@@ -446,6 +647,26 @@ function getContrastRatio(color1: RGB, color2: RGB): number {
   const lighter = Math.max(l1, l2);
   const darker = Math.min(l1, l2);
   return (lighter + 0.05) / (darker + 0.05);
+}
+
+function getLetterSpacingPx(letterSpacing: any, fontSize: number): number {
+  if (!letterSpacing) return 0;
+  if (typeof letterSpacing === 'number') return letterSpacing;
+  if ('unit' in letterSpacing && 'value' in letterSpacing) {
+    if (letterSpacing.unit === 'PIXELS') return letterSpacing.value;
+    if (letterSpacing.unit === 'PERCENT') return (letterSpacing.value / 100) * fontSize;
+  }
+  return 0;
+}
+
+function getLineHeightPx(lineHeight: any, fontSize: number): number | null {
+  if (!lineHeight) return null;
+  if (typeof lineHeight === 'number') return lineHeight;
+  if ('unit' in lineHeight && 'value' in lineHeight) {
+    if (lineHeight.unit === 'PIXELS') return lineHeight.value;
+    if (lineHeight.unit === 'PERCENT') return (lineHeight.value / 100) * fontSize;
+  }
+  return null;
 }
 
 function lintAccessibility(node: SceneNode): Issue[] {
@@ -470,32 +691,37 @@ function lintAccessibility(node: SceneNode): Issue[] {
     return issues;
   }
   
-  const textPaint = textNode.fills[0];
-  if (textPaint.type !== 'SOLID' || !textPaint.visible) {
+  const visibleTextPaints = textNode.fills.filter(
+    (paint) => paint.visible !== false && paint.type !== 'IMAGE' && paint.type !== 'VIDEO'
+  );
+  if (visibleTextPaints.length === 0) {
     return issues;
   }
-  
-  const textColor = textPaint.color;
-  const textOpacity = (textPaint.opacity !== undefined ? textPaint.opacity : 1) * (textNode.opacity !== undefined ? textNode.opacity : 1);
+
+  const textComposite = compositePaints(visibleTextPaints, { r: 0, g: 0, b: 0, a: 0 });
+  if (!textComposite) {
+    return issues;
+  }
+
+  const textOpacityFactor = textNode.opacity !== undefined ? textNode.opacity : 1;
+  const textColorRGBA: RGBAColor = { ...textComposite, a: textComposite.a * textOpacityFactor };
   
   // Get background color (from parent frame or page)
-  let bgColor: RGB | null = null;
+  let bgColor: RGBAColor | null = null;
   let current: BaseNode | null = textNode.parent;
   
   while (current) {
     if (current.type === 'FRAME' && 'backgrounds' in current) {
       const frame = current as FrameNode;
-      if (frame.backgrounds && frame.backgrounds.length > 0) {
-        const bgPaint = frame.backgrounds[0];
-        if (bgPaint.type === 'SOLID' && bgPaint.visible) {
-          bgColor = bgPaint.color;
-          break;
-        }
+      const bgComposite = compositePaints(frame.backgrounds, WHITE);
+      if (bgComposite) {
+        bgColor = bgComposite;
+        break;
       }
     }
     if (current.type === 'PAGE') {
       // Default to white for page background
-      bgColor = { r: 1, g: 1, b: 1 };
+      bgColor = WHITE;
       break;
     }
     current = current.parent;
@@ -505,33 +731,55 @@ function lintAccessibility(node: SceneNode): Issue[] {
     return issues;
   }
   
-  // Apply opacity to text color
-  const effectiveTextColor: RGB = {
-    r: bgColor.r + (textColor.r - bgColor.r) * textOpacity,
-    g: bgColor.g + (textColor.g - bgColor.g) * textOpacity,
-    b: bgColor.b + (textColor.b - bgColor.b) * textOpacity,
-  };
+  const effectiveTextColor = rgbaToOpaque(textColorRGBA, bgColor);
+  const effectiveBgColor = rgbaToOpaque(bgColor, WHITE);
   
-  const contrastRatio = getContrastRatio(effectiveTextColor, bgColor);
+  const contrastRatio = getContrastRatio(effectiveTextColor, effectiveBgColor);
   
   // Check font size to determine required contrast
   const fontSize = typeof textNode.fontSize === 'number' ? textNode.fontSize : 14;
   const fontWeight = typeof textNode.fontWeight === 'number' ? textNode.fontWeight : 400;
-  const isLargeText = fontSize >= 18 || (fontSize >= 14 && fontWeight >= 700);
-  const requiredRatio = isLargeText ? 3.0 : 4.5; // WCAG AA standard
+  const letterSpacingPx = getLetterSpacingPx((textNode as any).letterSpacing, fontSize);
+  const lineHeightPx = getLineHeightPx((textNode as any).lineHeight, fontSize) ?? fontSize * 1.2;
+  const effectiveSize = fontSize + Math.max(0, letterSpacingPx * 0.5) + Math.max(0, lineHeightPx - fontSize) * 0.05;
+  const isLargeText = effectiveSize >= 18 || (effectiveSize >= 14 && fontWeight >= 700);
+
+  const targetLevel = accessibilityOptions.contrastLevel || 'aa';
+  const requiredRatio =
+    targetLevel === 'aaa'
+      ? isLargeText
+        ? 4.5
+        : 7.0
+      : isLargeText
+      ? 3.0
+      : 4.5;
   
   if (contrastRatio < requiredRatio) {
     const ratio = contrastRatio.toFixed(2);
     const required = requiredRatio.toFixed(1);
     issues.push({
-      id: `${node.id}-contrast`,
+      id: makeIssueId(`${node.id}-contrast`),
       nodeId: node.id,
       nodeType: node.type,
       pageName,
       containerName: container.name,
       severity: 'error',
       type: 'low-contrast',
-      message: `Низкий контраст текста: ${ratio}:1 (требуется ${required}:1 для WCAG AA)`,
+      message: `Низкий контраст текста: ${ratio}:1 (требуется ${required}:1 для WCAG ${targetLevel.toUpperCase()})`,
+      path: nodePath,
+    });
+  }
+
+  if (accessibilityOptions.warnTransparent && textColorRGBA.a < 1) {
+    issues.push({
+      id: makeIssueId(`${node.id}-transparent-text`),
+      nodeId: node.id,
+      nodeType: node.type,
+      pageName,
+      containerName: container.name,
+      severity: 'warn',
+      type: 'transparent-text',
+      message: 'Текст частично прозрачный — проверьте контраст с учётом фона',
       path: nodePath,
     });
   }
@@ -561,7 +809,7 @@ function lintTextStyles(node: SceneNode): Issue[] {
     const textStyleId = textNode.textStyleId;
     if (!textStyleId || typeof textStyleId !== 'string') {
       issues.push({
-        id: `${node.id}-text-style`,
+        id: makeIssueId(`${node.id}-text-style`),
         nodeId: node.id,
         nodeType: node.type,
         pageName,
@@ -614,7 +862,7 @@ function lintEffects(node: SceneNode): Issue[] {
     if (visibleEffects.length > 0) {
       const effectTypes = visibleEffects.map(e => e.type).join(', ');
       issues.push({
-        id: `${node.id}-effects`,
+        id: makeIssueId(`${node.id}-effects`),
         nodeId: node.id,
         nodeType: node.type,
         pageName,
@@ -629,6 +877,7 @@ function lintEffects(node: SceneNode): Issue[] {
   
   return issues;
 }
+
 
 // ============================================================================
 // Plugin Initialization
@@ -666,488 +915,9 @@ linter.addRule({
 
 console.log('Initializing plugin...');
 
-// Load UI - when "ui" is specified in manifest.json, Figma loads it automatically
-// We need to use the HTML content directly
-const htmlContent = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Design Linter</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #333; background: #fff; padding: 12px; overflow-x: hidden; overflow-y: auto; }
-    .header { margin-bottom: 12px; }
-    .controls { display: flex; gap: 8px; margin-bottom: 12px; }
-    .filter-btn { display: flex; align-items: center; justify-content: center; padding: 8px; min-width: 40px; }
-    .filter-btn svg { width: 18px; height: 18px; fill: currentColor; }
-    .filter-btn.active { background: #18a0fb; color: #fff; }
-    .filter-btn.active:hover { background: #1590e6; }
-    #filters-container { display: none; }
-    #filters-container.visible { display: block; }
-    select { flex: 1; padding: 8px; border: 1px solid #e0e0e0; border-radius: 4px; font-size: 12px; background: #fff; appearance: none; -webkit-appearance: none; -moz-appearance: none; background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e"); background-repeat: no-repeat; background-position: right 8px center; background-size: 16px; padding-right: 32px; }
-    button { padding: 8px 16px; border: none; border-radius: 4px; font-size: 12px; font-weight: 500; cursor: pointer; transition: background 0.2s; }
-    button.primary { background: #18a0fb; color: #fff; }
-    button.primary:hover { background: #1590e6; }
-    button.secondary { background: #f0f0f0; color: #333; margin-left: 0; }
-    button.secondary:hover { background: #e0e0e0; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .stats { display: flex; gap: 16px; padding: 12px; background: #f8f8f8; border-radius: 4px; margin-bottom: 12px; font-size: 11px; }
-    .stat { display: flex; flex-direction: column; }
-    .stat-label { color: #666; margin-bottom: 4px; }
-    .stat-value { font-weight: 600; font-size: 14px; }
-    .stat-value.error { color: #e53935; }
-    .stat-value.warn { color: #ff9800; }
-    .results { overflow: visible; }
-    .results-empty { text-align: center; padding: 32px; color: #999; }
-    .issue-group { margin-bottom: 12px; }
-    .group-header { font-weight: 600; font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 8px; padding: 4px 0; border-bottom: 1px solid #e0e0e0; }
-    .issue { padding: 8px; margin-bottom: 6px; border-radius: 0; cursor: pointer; transition: background 0.2s; border-left: 3px solid transparent; word-wrap: break-word; overflow-wrap: break-word; }
-    .issue:hover { background: #f5f5f5; }
-    .issue.error { border-left-color: #e53935; }
-    .issue.warn { border-left-color: #ff9800; }
-    .issue-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-    .issue-severity { font-size: 10px; font-weight: 600; text-transform: uppercase; padding: 2px 6px; border-radius: 3px; }
-    .issue-severity.error { background: #ffebee; color: #e53935; }
-    .issue-severity.warn { background: #fff3e0; color: #ff9800; }
-    .issue-type { font-size: 10px; color: #999; }
-    .issue-message { font-size: 11px; color: #333; margin-bottom: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; line-height: 1.4; }
-    .issue-path { font-size: 10px; color: #999; font-family: 'Monaco', 'Courier New', monospace; word-wrap: break-word; overflow-wrap: break-word; max-width: 100%; }
-    .loading { text-align: center; padding: 32px; color: #999; }
-    .checkboxes { margin-bottom: 12px; padding: 12px; background: #f8f8f8; border-radius: 4px; }
-    .checkboxes-label { font-size: 11px; font-weight: 600; color: #666; margin-bottom: 8px; display: block; }
-    .checkbox-group { display: flex; flex-direction: column; gap: 6px; }
-    .checkbox-item { display: flex; align-items: center; gap: 6px; }
-    .checkbox-item input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; }
-    .checkbox-item label { font-size: 12px; color: #333; cursor: pointer; user-select: none; }
-
-    details.panel { margin-bottom: 12px; padding: 12px; background: #f8f8f8; border-radius: 4px; }
-    details.panel > summary { list-style: none; cursor: pointer; font-size: 11px; font-weight: 600; color: #666; user-select: none; }
-    details.panel > summary::-webkit-details-marker { display: none; }
-    details.panel > summary::after { content: '▾'; float: right; color: #999; font-size: 14px; line-height: 1; }
-    details.panel:not([open]) > summary::after { content: '▸'; }
-    details.panel > .panel-body { margin-top: 8px; }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <div class="controls">
-      <select id="scope-select">
-        <option value="selection">Выбранные элементы</option>
-        <option value="currentPage" selected>Текущая страница</option>
-      </select>
-      <button id="filter-toggle-btn" class="filter-btn secondary" title="Фильтры">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-          <path d="M10 18h4v-2h-4v2zM3 6v2h18V6H3zm3 7h12v-2H6v2z"/>
-        </svg>
-      </button>
-      <button id="run-btn" class="primary">Поиск</button>
-    </div>
-    <div id="filters-container">
-    <details class="panel">
-      <summary>Фильтр по элементам</summary>
-      <div class="panel-body">
-        <div class="checkbox-group">
-          <div class="checkbox-item">
-            <input type="checkbox" id="filter-components" checked>
-            <label for="filter-components">Компоненты</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="filter-instances" checked>
-            <label for="filter-instances">Инстансы</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="filter-text" checked>
-            <label for="filter-text">Текст</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="filter-containers" checked>
-            <label for="filter-containers">Контейнеры</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="filter-shapes" checked>
-            <label for="filter-shapes">Фигуры</label>
-          </div>
-        </div>
-      </div>
-    </details>
-    <details class="panel" open>
-      <summary>Типы проверок</summary>
-      <div class="panel-body">
-        <div class="checkbox-group">
-          <div class="checkbox-item">
-            <input type="checkbox" id="check-colors" checked>
-            <label for="check-colors">Цвета (без Style/Variable)</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="check-accessibility" checked>
-            <label for="check-accessibility">Доступность (контраст)</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="check-unused-styles" checked>
-            <label for="check-unused-styles">Неиспользуемые стили</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="check-text-styles" checked>
-            <label for="check-text-styles">Текстовые стили</label>
-          </div>
-          <div class="checkbox-item">
-            <input type="checkbox" id="check-effects" checked>
-            <label for="check-effects">Эффекты (тени, размытие)</label>
-          </div>
-        </div>
-      </div>
-    </details>
-    </div>
-  </div>
-  <div id="stats" class="stats" style="display: none;">
-    <div class="stat"><div class="stat-label">Всего проблем</div><div class="stat-value" id="total-count">0</div></div>
-    <div class="stat"><div class="stat-label">Ошибки</div><div class="stat-value error" id="error-count">0</div></div>
-    <div class="stat"><div class="stat-label">Предупреждения</div><div class="stat-value warn" id="warn-count">0</div></div>
-  </div>
-  <div id="results" class="results"></div>
-  <script>
-    (function() {
-      console.log('UI script loaded');
-      let currentResult = null;
-      let allIssues = [];
-      let scopeSelect, runBtn, statsDiv, totalCount, errorCount, warnCount, resultsDiv;
-      let filterToggleBtn, filtersContainer;
-      let filtersDiv, filterType, filterSeverity, filterContainer;
-      let filterComponents, filterInstances, filterText, filterContainers, filterShapes;
-      
-      function initializeUI() {
-        console.log('Initializing UI...');
-        scopeSelect = document.getElementById('scope-select');
-        runBtn = document.getElementById('run-btn');
-        filterToggleBtn = document.getElementById('filter-toggle-btn');
-        filtersContainer = document.getElementById('filters-container');
-        statsDiv = document.getElementById('stats');
-        totalCount = document.getElementById('total-count');
-        errorCount = document.getElementById('error-count');
-        warnCount = document.getElementById('warn-count');
-        resultsDiv = document.getElementById('results');
-        filtersDiv = document.getElementById('filters');
-        filterType = document.getElementById('filter-type');
-        filterSeverity = document.getElementById('filter-severity');
-        filterContainer = document.getElementById('filter-container');
-        filterComponents = document.getElementById('filter-components');
-        filterInstances = document.getElementById('filter-instances');
-        filterText = document.getElementById('filter-text');
-        filterContainers = document.getElementById('filter-containers');
-        filterShapes = document.getElementById('filter-shapes');
-        
-        // Required elements
-        if (!scopeSelect || !runBtn || !statsDiv || !totalCount || !errorCount || !warnCount || !resultsDiv) {
-          console.error('Failed to find required DOM elements');
-          console.error('Elements found:', {
-            scopeSelect: !!scopeSelect,
-            runBtn: !!runBtn,
-            statsDiv: !!statsDiv,
-            totalCount: !!totalCount,
-            errorCount: !!errorCount,
-            warnCount: !!warnCount,
-            resultsDiv: !!resultsDiv
-          });
-          return;
-        }
-        
-        // Filter elements are optional
-        if (filtersDiv && filterType && filterSeverity && filterContainer) {
-          // Set up filter handlers - functions will be defined later
-          filterType.addEventListener('change', handleFilterChange);
-          filterSeverity.addEventListener('change', handleFilterChange);
-          filterContainer.addEventListener('change', handleFilterChange);
-        }
-
-        // Node type filter elements
-        const nodeFilterEls = [filterComponents, filterInstances, filterText, filterContainers, filterShapes].filter(Boolean);
-        nodeFilterEls.forEach((el) => {
-          el.addEventListener('change', () => {
-            if (allIssues && allIssues.length > 0) {
-              renderFiltered();
-            }
-          });
-        });
-        
-        console.log('UI initialized successfully');
-        
-        // Filter toggle button
-        if (filterToggleBtn && filtersContainer) {
-          filterToggleBtn.addEventListener('click', () => {
-            const isVisible = filtersContainer.classList.toggle('visible');
-            if (isVisible) {
-              filterToggleBtn.classList.add('active');
-            } else {
-              filterToggleBtn.classList.remove('active');
-            }
-          });
-        }
-        
-        runBtn.addEventListener('click', () => {
-          const scope = scopeSelect.value;
-          runLint(scope);
-        });
-        
-        function handleFilterChange() {
-          if (allIssues && allIssues.length > 0 && typeof applyFilters === 'function') {
-            applyFilters();
-          }
-        }
-      }
-      
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initializeUI);
-      } else {
-        initializeUI();
-      }
-      
-      window.onmessage = (event) => {
-        console.log('UI window.onmessage called, event:', event);
-        const msg = event.data?.pluginMessage;
-        console.log('UI received message:', msg);
-        if (!msg) {
-          console.warn('No pluginMessage in event.data');
-          return;
-        }
-        if (msg.type === 'lint-result') {
-          console.log('Calling displayResults with:', msg.result);
-          displayResults(msg.result);
-        } else if (msg.type === 'lint-error') {
-          console.log('Calling displayError with:', msg.error);
-          displayError(msg.error);
-        } else {
-          console.warn('Unknown message type:', msg.type, msg);
-        }
-      };
-      
-      function runLint(scope) {
-        console.log('runLint called with scope:', scope);
-        if (!runBtn || !resultsDiv || !statsDiv) {
-          console.error('UI elements not initialized');
-          return;
-        }
-        
-        // Get selected check types
-        const checkColors = document.getElementById('check-colors')?.checked ?? true;
-        const checkAccessibility = document.getElementById('check-accessibility')?.checked ?? true;
-        const checkUnusedStyles = document.getElementById('check-unused-styles')?.checked ?? true;
-        const checkTextStyles = document.getElementById('check-text-styles')?.checked ?? true;
-        const checkEffects = document.getElementById('check-effects')?.checked ?? true;
-        
-        const checkTypes = {
-          colors: checkColors,
-          accessibility: checkAccessibility,
-          unusedStyles: checkUnusedStyles,
-          textStyles: checkTextStyles,
-          effects: checkEffects
-        };
-        
-        runBtn.disabled = true;
-        runBtn.textContent = 'Выполняется...';
-        resultsDiv.innerHTML = '<div class="loading">Сканирование дизайна...</div>';
-        statsDiv.style.display = 'none';
-        if (filtersDiv) filtersDiv.style.display = 'none';
-        
-        const message = { pluginMessage: { type: 'run-lint', scope, checkTypes } };
-        console.log('Sending message to plugin:', message);
-        try {
-          parent.postMessage(message, '*');
-        } catch (error) {
-          console.error('Error sending message:', error);
-          runBtn.disabled = false;
-          runBtn.textContent = 'Поиск';
-          resultsDiv.innerHTML = '<div class="results-empty" style="color: #e53935;">Ошибка отправки сообщения</div>';
-        }
-      }
-      
-      function displayResults(result) {
-        currentResult = result;
-        allIssues = result.issues;
-        if (!runBtn || !statsDiv || !totalCount || !errorCount || !warnCount || !resultsDiv) {
-          console.error('UI elements not initialized');
-          return;
-        }
-        runBtn.disabled = false;
-        runBtn.textContent = 'Поиск';
-        statsDiv.style.display = 'flex';
-        
-        renderFiltered();
-      }
-
-      function updateStats(issues) {
-        if (!totalCount || !errorCount || !warnCount) return;
-        const total = issues ? issues.length : 0;
-        const errors = issues ? issues.filter(i => i.severity === 'error').length : 0;
-        const warnings = issues ? issues.filter(i => i.severity === 'warn').length : 0;
-        totalCount.textContent = total.toString();
-        errorCount.textContent = errors.toString();
-        warnCount.textContent = warnings.toString();
-      }
-
-      function getNodeCategory(nodeType) {
-        if (!nodeType) return null;
-        if (nodeType === 'COMPONENT' || nodeType === 'COMPONENT_SET') return 'components';
-        if (nodeType === 'INSTANCE') return 'instances';
-        if (nodeType === 'TEXT' || nodeType === 'TEXT_PATH') return 'text';
-        if (nodeType === 'FRAME' || nodeType === 'SECTION' || nodeType === 'GROUP' || nodeType === 'TRANSFORM_GROUP') return 'containers';
-        const shapes = new Set(['RECTANGLE','ELLIPSE','POLYGON','STAR','LINE','VECTOR','BOOLEAN_OPERATION','SHAPE_WITH_TEXT','CONNECTOR']);
-        if (shapes.has(nodeType)) return 'shapes';
-        return null;
-      }
-
-      function passesNodeFilters(issue) {
-        // Issues without node context (e.g. unused styles) are always shown
-        if (!issue || !issue.nodeId) return true;
-
-        const category = getNodeCategory(issue.nodeType);
-        if (!category) return true;
-
-        const enabled = {
-          components: filterComponents?.checked ?? true,
-          instances: filterInstances?.checked ?? true,
-          text: filterText?.checked ?? true,
-          containers: filterContainers?.checked ?? true,
-          shapes: filterShapes?.checked ?? true
-        };
-
-        return enabled[category] === true;
-      }
-
-      function getIssueGroup(issue) {
-        if (!issue) return 'other';
-        if (issue.type === 'low-contrast' || issue.type === 'text-without-style') return 'text';
-        if (issue.type === 'unused-style') return 'styles';
-        if (issue.type === 'effects-without-style') return 'effects';
-        if (issue.paintContext && issue.paintContext.property === 'fills') return 'fill';
-        if (issue.paintContext && issue.paintContext.property === 'strokes') return 'stroke';
-        if (issue.paintContext && issue.paintContext.property === 'backgrounds') return 'background';
-        return 'other';
-      }
-
-      function groupIssuesByType(issues) {
-        const grouped = {};
-        for (const issue of issues) {
-          if (!grouped[issue.pageName]) grouped[issue.pageName] = {};
-          if (!grouped[issue.pageName][issue.containerName]) grouped[issue.pageName][issue.containerName] = {};
-          const bucket = getIssueGroup(issue);
-          if (!grouped[issue.pageName][issue.containerName][bucket]) grouped[issue.pageName][issue.containerName][bucket] = [];
-          grouped[issue.pageName][issue.containerName][bucket].push(issue);
-        }
-        return grouped;
-      }
-
-      function renderFiltered() {
-        if (!resultsDiv) return;
-
-        if (!allIssues || allIssues.length === 0) {
-          updateStats([]);
-          resultsDiv.innerHTML = '<div class="results-empty">✓ Проблем не найдено! Все цвета используют Styles или Variables.</div>';
-          return;
-        }
-
-        const filtered = allIssues.filter(passesNodeFilters);
-        if (filtered.length === 0) {
-          updateStats([]);
-          resultsDiv.innerHTML = '<div class="results-empty">Нет проблем, соответствующих выбранным фильтрам.</div>';
-          return;
-        }
-
-        updateStats(filtered);
-
-        const grouped = groupIssuesByType(filtered);
-        const groupLabels = {
-          fill: 'Fill',
-          stroke: 'Stroke',
-          background: 'Background',
-          text: 'Text',
-          effects: 'Effects',
-          styles: 'Styles',
-          other: 'Other'
-        };
-        const groupOrder = ['fill','stroke','background','text','effects','styles','other'];
-
-        let html = '';
-        for (const pageName in grouped) {
-          const pageIssues = grouped[pageName];
-          for (const containerName in pageIssues) {
-            const byType = pageIssues[containerName];
-            html += '<div class="issue-group"><div class="group-header">' + escapeHtml(containerName) + '</div>';
-
-            for (const groupKey of groupOrder) {
-              const issuesInGroup = byType[groupKey];
-              if (!issuesInGroup || issuesInGroup.length === 0) continue;
-              html += '<div style="margin: 6px 0 4px; font-weight: 600; font-size: 10px; color: #666; text-transform: uppercase;">' + groupLabels[groupKey] + '</div>';
-              for (const issue of issuesInGroup) {
-                html += renderIssue(issue);
-              }
-            }
-            html += '</div>';
-          }
-        }
-        resultsDiv.innerHTML = html;
-
-        const issueElements = resultsDiv.querySelectorAll('.issue');
-        issueElements.forEach((el) => {
-          const nodeId = el.getAttribute('data-node-id');
-          if (nodeId) {
-            el.addEventListener('click', () => selectNode(nodeId));
-          }
-        });
-      }
-      
-      function groupIssues(issues) {
-        const grouped = {};
-        for (const issue of issues) {
-          if (!grouped[issue.pageName]) grouped[issue.pageName] = {};
-          if (!grouped[issue.pageName][issue.containerName]) grouped[issue.pageName][issue.containerName] = [];
-          grouped[issue.pageName][issue.containerName].push(issue);
-        }
-        return grouped;
-      }
-      
-      function renderIssue(issue) {
-        const severityText = issue.severity === 'error' ? 'ошибка' : 'предупреждение';
-        const typeTextMap = {
-          'color-without-style-or-variable': 'цвет без Style/Variable',
-          'mixed-paints': 'смешанные значения',
-          'low-contrast': 'низкий контраст',
-          'unused-style': 'неиспользуемый стиль',
-          'text-without-style': 'текст без стиля',
-          'effects-without-style': 'эффекты без стиля'
-        };
-        const typeText = typeTextMap[issue.type] || issue.type;
-        const nodeIdAttr = issue.nodeId ? 'data-node-id="' + issue.nodeId + '"' : '';
-        return '<div class="issue ' + issue.severity + '" ' + nodeIdAttr + '><div class="issue-header"><span class="issue-severity ' + issue.severity + '">' + severityText + '</span><span class="issue-type">' + escapeHtml(typeText) + '</span></div><div class="issue-message">' + escapeHtml(issue.message) + '</div><div class="issue-path">' + escapeHtml(issue.path) + '</div></div>';
-      }
-      
-      function selectNode(nodeId) {
-        parent.postMessage({ pluginMessage: { type: 'select-node', nodeId } }, '*');
-      }
-      
-      function displayError(error) {
-        if (!runBtn || !resultsDiv) {
-          console.error('UI elements not initialized');
-          return;
-        }
-        runBtn.disabled = false;
-        runBtn.textContent = 'Поиск';
-        resultsDiv.innerHTML = '<div class="results-empty" style="color: #e53935;">Ошибка: ' + escapeHtml(error) + '</div>';
-      }
-      
-      
-      function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-      }
-    })();
-  </script>
-</body>
-</html>`;
-
-figma.showUI(htmlContent, {
-  width: 400,
-  height: 600,
+figma.showUI(__html__, {
+  width: 420,
+  height: 620,
   title: 'Проверка дизайна',
 });
 
@@ -1161,9 +931,36 @@ figma.ui.onmessage = async (msg: any) => {
     return;
   }
   
+  if (msg.type === 'request-settings') {
+    const settings = await loadSettings();
+    figma.ui.postMessage({ type: 'settings', settings });
+    return;
+  }
+
+  if (msg.type === 'save-settings') {
+    await saveSettings(msg.settings || defaultSettings);
+    return;
+  }
+  
   if (msg.type === 'run-lint') {
     const scope: Scope = msg.scope || 'currentPage';
-    const checkTypes = msg.checkTypes || { colors: true, accessibility: true, unusedStyles: true, textStyles: true, effects: true };
+    const checkTypes = {
+      colors: true,
+      accessibility: true,
+      unusedStyles: true,
+      unusedTextStyles: true,
+      unusedEffectStyles: true,
+      textStyles: true,
+      effects: true,
+      contrastLevel: 'aa' as ContrastLevel,
+      warnTransparent: true,
+      ...(msg.checkTypes || {}),
+    };
+    accessibilityOptions = {
+      contrastLevel: checkTypes.contrastLevel === 'aaa' ? 'aaa' : 'aa',
+      warnTransparent: checkTypes.warnTransparent !== false,
+    };
+    issueCounter = 0;
     console.log('Running lint with scope:', scope, 'checkTypes:', checkTypes);
 
     try {
@@ -1214,6 +1011,16 @@ figma.ui.onmessage = async (msg: any) => {
         allIssues.push(...unusedStyleIssues);
         console.log('Found unused styles:', unusedStyleIssues.length);
       }
+      if (checkTypes.unusedTextStyles) {
+        const unusedText = lintUnusedTextStyles(nodes);
+        allIssues.push(...unusedText);
+        console.log('Found unused text styles:', unusedText.length);
+      }
+      if (checkTypes.unusedEffectStyles) {
+        const unusedEffects = lintUnusedEffectStyles(nodes);
+        allIssues.push(...unusedEffects);
+        console.log('Found unused effect styles:', unusedEffects.length);
+      }
 
       // Calculate statistics
       const errors = allIssues.filter((i) => i.severity === 'error').length;
@@ -1225,7 +1032,6 @@ figma.ui.onmessage = async (msg: any) => {
         errors,
         warnings,
       };
-
       console.log('Sending result:', result);
       figma.ui.postMessage({
         type: 'lint-result',
